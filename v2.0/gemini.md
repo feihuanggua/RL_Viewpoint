@@ -1,38 +1,33 @@
-# Project Context: UAV Exploration Viewpoint Generation via DRL
+
+# Project Context: UAV Exploration Viewpoint Generation via DRL (Advanced Version)
 
 ## 1. 项目核心目标 (Project Objective)
 
-将无人机自主探索中的“视点选择”模块，从传统的**启发式射线投射（Heuristic Raycasting）**升级为**深度强化学习（Deep Reinforcement Learning, DRL）**方法。
+构建一个基于深度强化学习（DRL）的端到端视点生成模型，用于无人机自主探索。
 
-* **输入**：局部的栅格地图（ESDF/Occupancy Grid）、前沿簇（Frontier Cluster）、已知区域掩码（Known Mask）。
+* **输入**：局部 3D 体素地图（3通道）。
 * **输出**：最佳观测位姿 $(x, y, z, yaw)$。
-* **目标**：最大化前沿表面的覆盖率（Surface Coverage）和未知区域的穿透体积（Penetrated Volume），同时确保飞行安全。
+* **核心升级**：从简单的 CNN+MLP 升级为 **Attention-Enhanced Residual Network**，并针对 **边缘端部署 (NPU/TensorRT)** 进行了算子优化。
 
 ---
 
 ## 2. 核心算法思路 (Methodology)
 
-### 2.1 整体架构
+### 2.1 整体架构 (NBV via DRL)
 
-采用 **"Next Best View (NBV)"** 的单步决策模式进行训练：
+* **场景**：生成“前沿墙 + 背后未知区域 + 隐形障碍物”的训练场景。
+* **对齐**：使用 **DBSCAN** 聚类前沿，通过 **PCA (仅 Yaw 旋转)** 将局部地图标准化。
+* **决策**：网络根据标准化体素，输出相对于前沿中心的局部坐标和偏航角。
+* **约束**：采用 **软约束 (Soft Constraint)**，通过 Known Mask 通道和惩罚项，教会 Agent 待在安全区。
 
-1. **场景生成**：随机生成一面“前沿墙”，墙后是未知区域和隐形障碍物。
-2. **预处理**：对全局地图进行 **DBSCAN 聚类** 和 **PCA 局部对齐**。
-3. **推理**：Agent 根据标准化后的局部体素地图，输出一个观测视点。
-4. **评估**：计算视点的 FOV 覆盖收益（表面积 + 体积）作为 Reward。
+### 2.2 网络架构升级 (Model Evolution)
 
-### 2.2 关键技术点
+为了解决简单 MLP 无法处理复杂空间关系的问题，引入了以下机制：
 
-* **PCA 对齐 (Canonicalization)**：
-  * 为了提高泛化性，不直接输入全局地图。
-  * **逻辑**：只计算 XY 平面的主方向（Yaw），进行旋转和平移，保留 Z 轴特征（如斜坡）。
-  * **结果**：网络看到的永远是“正前方有一面前沿”，输出动作也是相对于前沿中心的局部坐标。
-* **双重收益机制**：
-  * 单纯追求“穿透体积”会导致 Agent 贴脸观测。
-  * **修正**：引入“前沿表面积覆盖”作为主奖励，利用 FOV 几何特性迫使 Agent 后退，以获得更大的视野截面。
-* **安全性约束 (Safety)**：
-  * **放弃**了 KD-Tree 强制投影的硬约束。
-  * **采用**软约束（Soft Constraint）：在 Reward 函数中对“飞入未知区域”或“撞墙”施加巨额惩罚（-2.0 ~ -10.0），让 Agent 自主学会待在 Known Mask 内。
+* **3D Attention**：引入 Spatial & Channel Attention，让网络忽略空白区域，聚焦几何特征。
+* **Residual Connections**：使用 ResMLP Block 防止梯度消失，加深网络。
+* **Decoupled Heads**：将位置 ($x,y,z$) 和朝向 ($yaw$) 解耦。采用**自回归逻辑**：先决定站位，再根据站位决定看哪里。
+* **Deployment Friendly**：移除了 `AdaptiveAvgPool3d` 等 NPU 不友好的算子，全线使用标准算子。
 
 ---
 
@@ -44,52 +39,89 @@
 
 * **Channel 0**: `Known Obstacles` (已知障碍物，避障用)
 * **Channel 1**: `Frontier Surface` (前沿面，目标)
-* **Channel 2**: `Known Mask` (安全飞行区域，越界即死)
+* **Channel 2**: `Known Mask` (安全飞行区域，**核心约束**，出界即死)
 
 ### 3.2 动作空间 (Action Space)
 
-维度：`[4]` (Continuous)
+维度：`[4]` (Continuous, Range `[-1, 1]`)
 
-* `[lx, ly, lz, lyaw]`：相对于 PCA 局部坐标系中心的位移和偏航角偏移。
-* 范围：`[-1, 1]`，在 `step` 中会被缩放（如 `scale=12.0`）。
+* 物理含义：相对于局部坐标系中心的位移和偏航角偏移。
+* 缩放系数：`scale=12.0`。
 
 ### 3.3 奖励函数 (Reward Function)
 
 $$
-R = (\alpha \cdot N_{surface} + \beta \cdot N_{volume}) \times \text{Scale} - \text{Penalty}_{dist}
+R = (\alpha \cdot N_{surface} + \beta \cdot N_{volume}) \times 0.01 - \text{Penalty}
 $$
 
-* **Surface Hits ($N_{surface}$)**: 射线击中的前沿点数量（权重 $\alpha=1.0$）。
-* **Volume Hits ($N_{volume}$)**: 射线穿透到未知区域的点数量（权重 $\beta=0.05$）。
-* **Reward Scale**: `0.01` (将数百的 Hits 缩放到个位数，防止梯度爆炸)。
-* **惩罚**:
-  * 越界/撞墙/飞入未知区：给予 `-2.0` (缩放后量级) 并结束回合。
+* **收益**：表面积覆盖 ($N_{surface}$) + 体积穿透 ($N_{volume}$)。
+* **缩放**：整体乘以 `0.01`，将数值从 ~200 降至 ~2.0，防止梯度爆炸。
+* **惩罚**：
+  * 越界/撞墙/飞入未知区：给予 `-2.0` (与收益量级相当) 并结束回合。
 
 ---
 
-## 4. 网络模型 (`model.py`)
+## 4. 网络模型细节 (`model.py`)
 
-* **架构**：Actor-Critic (PPO)。
-* **Backbone**：3D CNN (VoxNet 变体)。
-  * Input: `(B, 3, 32, 32, 32)`
-  * Layers: 3层 Conv3d + BatchNorm3d + ReLU。
-* **Heads**：
-  * Actor: 输出 Mean (Tanh激活) + 可学习的 LogStd。
-  * Critic: 输出 Value。
+### 4.1 Backbone
+
+* **Input**: `(B, 3, 32, 32, 32)`
+* **Structure**: 3层 `Conv3d` + `BatchNorm3d` + `LeakyReLU`。
+* **Attention**:
+  * `ChannelAttention3D`: 使用 `torch.mean` 代替 AdaptivePool。
+  * `SpatialAttention3D`: Max + Avg pooling -> Conv3d -> Sigmoid。
+
+### 4.2 Decoupled Heads
+
+* **Shared Embedding**: Flatten -> Linear -> LayerNorm.
+* **Stream A (Position)**: ResMLP -> `Linear(3)` -> Tanh.
+* **Stream B (Yaw)**: Input(`Shared` + `Pos_Output`) -> ResMLP -> `Linear(1)` -> Tanh.
+* **Critic**: ResMLP -> Value.
 
 ---
 
-## 5. 训练配置与细节 (`train.py` & `config.py`)
+## 5. 训练配置 (`train.py` & `config.py`)
 
-### 5.1 优化器分组 (Critical fix)
+### 5.1 智能参数分组 (Auto-Grouping)
 
-**重要**：必须正确处理 PyTorch 优化器参数组，防止漏掉 BatchNorm 参数。
+优化器定义不再硬编码层名称，而是通过逻辑自动提取：
 
-```python
-# 推荐写法
-optimizer = optim.Adam([
-    {'params': actor_params, 'lr': 5e-5},
-    {'params': critic_params, 'lr': 1e-4},
-    {'params': backbone_params, 'lr': 1e-4} # 包含 Conv 和 BN
-])
-```
+1. **Actor Params**: `pos_net`, `yaw_net`, `log_std`.
+2. **Critic Params**: `critic_net`.
+3. **Backbone Params**: `filter(remaining parameters)`.
+
+* **优势**：修改模型结构后无需修改训练脚本，自动包含 BN、Attention 等所有层。
+
+### 5.2 监控与日志
+
+* **CSV Logging**: 记录 `episode`, `reward`, `loss` 到 `training_log.csv`。
+* **Plotting**: 提供 `plot_training.py` 绘制平滑后的训练曲线。
+
+### 5.3 超参数 (Fine-tuning phase)
+
+* `LR_ACTOR`: 5e-5 (低学习率，稳定策略)
+* `LR_CRITIC`: 1e-4
+* `BATCH_SIZE`: 64
+* `CKPT_PATH`: `ppo_penetration_checkpoint.pth` (需注意模型结构变更需删旧档)
+
+---
+
+## 6. 文件结构清单
+
+1. **`config.py`**: 全局配置。
+2. **`utils.py`**:
+   * `RayCaster`: 射线投射。
+   * `FrontierProcessor`: DBSCAN, PCA (Yaw only), Voxelization (3-Channel)。
+3. **`env.py`**: 环境逻辑 (3通道输入, Reward Scaling, Soft Constraints)。
+4. **`model.py`**: **[部署优化版]** Attention-Enhanced Actor-Critic。
+5. **`train.py`**: **[智能分组版]** PPO 训练循环 + CSV Logger。
+6. **`visualize_result.py`**: 结果可视化 (Cyan Surface, Gold Volume, Red/Green Agent)。
+7. **`plot_training.py`**: 训练曲线绘图工具。
+
+---
+
+## 7. 部署注意事项 (Deployment)
+
+* **算子兼容性**：模型已移除 `AdaptiveAvgPool3d`，所有算子（Conv3d, Mean, Max, MatMul）均支持 ONNX opset 11+。
+* **目标平台**：Nvidia Jetson (TensorRT) 或 Rockchip RK3588 (RKNN)。
+* **输入尺寸**：固定为 `32x32x32`，计算量极小，适合边缘端实时推理。

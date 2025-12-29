@@ -5,47 +5,40 @@ from utils import RayCaster, FrontierProcessor
 
 class PenetrationEnv(gym.Env):
     def __init__(self):
+        # ... (初始化部分不变) ...
         self.cfg = Config()
         self.grid_size = self.cfg.GRID_SIZE
-        
-        # 动作空间: [x, y, z, yaw] (-1 ~ 1)
-        # 代表相对于局部坐标系中心的位移和偏航角偏移
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
-        
-        # 状态空间: [3, 32, 32, 32]
-        # Channel 0: 已知障碍物 (Known Obstacles)
-        # Channel 1: 前沿面 (Frontier Surface)
-        # Channel 2: 已知/安全区域 (Known/Safe Space Mask)
         self.observation_space = gym.spaces.Box(low=0, high=1, shape=(3, 32, 32, 32), dtype=np.float32)
         
-        # 工具类初始化
         self.raycaster = RayCaster(map_size=self.grid_size)
         self.processor = FrontierProcessor(grid_size=self.grid_size)
         
-        # 内部变量 (Ground Truth & Logic)
-        self.gt_grid = None         # 真值地图 (含隐形障碍物)
-        self.known_obstacles = None # Agent 可见的障碍物
-        self.known_mask = None      # 安全飞行区域掩码
-        self.frontier_pts = None    # 前沿点列表
-        self.frontier_set = set()   # 前沿点集合 (加速查找)
-        self.unknown_mask = None    # 真值未知区域 (用于计算 Volume Reward)
+        self.gt_grid = None
+        self.known_obstacles = None
+        self.known_mask = None
+        self.frontier_pts = None 
+        self.frontier_set = set()
+        self.unknown_mask = None
         
-        self.current_center = None  # 当前前沿簇的几何中心 (全局)
-        self.current_yaw = None     # 当前前沿簇的主方向 Yaw (全局)
+        self.current_center = None
+        self.current_yaw = None
+        
+        # 记录上一帧的 Robot 位置，用于辅助判断方向
+        self.last_robot_pos = None
 
     def reset(self):
-        # 1. 初始化地图全 0
+        # ... (前半部分生成地图、障碍物的逻辑完全不变) ...
+        # ... (请保留原有的地图生成代码) ...
+        
+        # 1. 地图初始化 (简写)
         self.gt_grid = np.zeros((self.grid_size, self.grid_size, self.grid_size), dtype=np.int8)
         self.unknown_mask = np.zeros_like(self.gt_grid, dtype=bool)
         
-        # 2. 生成薄墙 (Frontier Surface)
-        # 位置随机在 X=14~18 之间，带有一定的斜率
         wall_x = np.random.randint(14, 18)
         self.frontier_pts = []
         self.frontier_set = set()
         slope = np.random.uniform(-0.5, 0.5)
-        
-        # 生成较大面积的墙，测试 FOV 覆盖能力
         for y in range(6, 26):
             for z in range(6, 26):
                 x = int(wall_x + (z - 16) * slope) 
@@ -53,81 +46,58 @@ class PenetrationEnv(gym.Env):
                     pt = (x, y, z)
                     self.frontier_pts.append(pt)
                     self.frontier_set.add(pt)
-                    
-                    # 定义: 墙和墙后面是未知的
-                    if x < self.grid_size:
-                        self.unknown_mask[x:, y, z] = True
-
+                    if x < self.grid_size: self.unknown_mask[x:, y, z] = True
         self.frontier_pts = np.array(self.frontier_pts)
-        
-        # 3. 生成障碍物
-        # A. 墙后面的障碍物 (隐形，待探测)
-        num_obs_back = np.random.randint(2, 6)
-        for _ in range(num_obs_back):
-            ox = np.random.randint(wall_x+1, 28)
-            oy = np.random.randint(8, 24)
-            oz = np.random.randint(8, 24)
-            # 边界检查防止越界赋值
-            x_end = min(ox+3, self.grid_size)
-            y_end = min(oy+3, self.grid_size)
-            z_end = min(oz+3, self.grid_size)
-            self.gt_grid[ox:x_end, oy:y_end, oz:z_end] = 1
 
-        # B. 墙前面的障碍物 (已知，需要避障)
-        num_obs_front = np.random.randint(0, 3)
-        for _ in range(num_obs_front):
-            ox = np.random.randint(2, max(3, wall_x-2))
-            oy = np.random.randint(8, 24)
-            oz = np.random.randint(8, 24)
-            x_end = min(ox+2, self.grid_size)
-            y_end = min(oy+2, self.grid_size)
-            z_end = min(oz+2, self.grid_size)
-            self.gt_grid[ox:x_end, oy:y_end, oz:z_end] = 1
+        # 2. 障碍物 (简写)
+        for _ in range(np.random.randint(2, 6)): # Back
+            ox, oy, oz = np.random.randint(wall_x+1, 28), np.random.randint(8, 24), np.random.randint(8, 24)
+            self.gt_grid[ox:ox+3, oy:oy+3, oz:oz+3] = 1
+        for _ in range(np.random.randint(0, 3)): # Front
+            ox, oy, oz = np.random.randint(2, max(3, wall_x-2)), np.random.randint(8, 24), np.random.randint(8, 24)
+            self.gt_grid[ox:ox+2, oy:oy+2, oz:oz+2] = 1
 
-        # 4. 构建 Known Mask (安全区)
-        # 逻辑: 非未知区域 (Known) 且 非障碍物 (Free)
+        # 3. Mask & Robot Pos
         self.known_mask = (~self.unknown_mask) & (self.gt_grid == 0)
-        
-        # Agent 只能看到安全区内的障碍物
         self.known_obstacles = self.gt_grid.copy()
         self.known_obstacles[self.unknown_mask] = 0 
+        
+        # 4. 设置初始 Robot 位置 (必须在墙前面)
+        # 我们假设墙前 10 格是安全的初始点
+        self.last_robot_pos = np.array([float(wall_x - 10), 16.0, 16.0])
 
         return self._get_observation()
 
     def _get_observation(self):
-        # 1. 对齐前沿 (PCA Yaw)
-        aligned_ft, center, yaw = self.processor.align_cluster_horizontal(self.frontier_pts)
+        # 【修改】传入 robot_pos 以便校正法向量方向
+        aligned_ft, center, yaw = self.processor.align_cluster_horizontal(self.frontier_pts, self.last_robot_pos)
         self.current_center = center
         self.current_yaw = yaw
         
-        # 预计算旋转矩阵 (Global -> Local)
+        # ... (后续体素化逻辑不变) ...
         c, s = np.cos(-yaw), np.sin(-yaw)
         R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
 
-        # 2. 对齐障碍物
         obs_indices = np.argwhere(self.known_obstacles == 1)
         aligned_obs = []
         if len(obs_indices) > 0:
-            centered_obs = obs_indices - center
-            aligned_obs = centered_obs @ R.T
+            aligned_obs = (obs_indices - center) @ R.T
 
-        # 3. 对齐已知区域 (Known Mask) -> Channel 2
         known_indices = np.argwhere(self.known_mask)
         aligned_known = []
         if len(known_indices) > 0:
-            centered_known = known_indices - center
-            aligned_known = centered_known @ R.T
+            aligned_known = (known_indices - center) @ R.T
 
-        # 4. 体素化 (3 Channels)
         state = self.processor.voxelize_aligned_cluster(aligned_ft, aligned_obs, aligned_known)
         return state
 
     def step(self, action):
-        # 1. 解析动作 (Local -> Global)
-        scale = 12.0 # 动作范围缩放
+        # 1. 解析动作
+        scale = 15.0 
         lx, ly, lz = action[0]*scale, action[1]*scale, action[2]*scale
         local_yaw_off = action[3] * np.pi 
         
+        # ... (坐标转换逻辑不变) ...
         c, s = np.cos(self.current_yaw), np.sin(self.current_yaw)
         gx = lx * c - ly * s
         gy = lx * s + ly * c
@@ -138,45 +108,73 @@ class PenetrationEnv(gym.Env):
         
         ix, iy, iz = int(target_pos[0]), int(target_pos[1]), int(target_pos[2])
         
-        # --- 2. 安全性检查 (软约束) ---
+        # --- 2. 关键修改：正面探索约束 ---
         
-        # A. 越界检查
+        # 计算 Agent 相对于墙中心的向量 (Global Frame)
+        vec_to_agent = target_pos - self.current_center
+        # 墙的法向量 (Global Frame, 已校正指向墙前)
+        wall_normal = np.array([np.cos(self.current_yaw), np.sin(self.current_yaw), 0])
+        
+        # 投影：判断 Agent 在墙前还是墙后
+        # dot > 0: 在墙前 (Known Side) -> Good
+        # dot < 0: 在墙后 (Unknown Side) -> Bad
+        dist_in_front = np.dot(vec_to_agent, wall_normal)
+        
+        # 判定：是否在"背后"
+        is_behind_wall = dist_in_front < -1.0 # 留1米的容差，防止贴太近误判
+        
+        # --- 安全性惩罚 ---
         if not (0 <= ix < self.grid_size and 0 <= iy < self.grid_size and 0 <= iz < self.grid_size):
-             return self._get_observation(), -0.5, True, {'status': 'out_of_bounds'}
-             
-        # B. 碰撞检查 (撞已知障碍物)
+             return self._get_observation(), -1.0, True, {'status': 'out_of_bounds'}
         if self.known_obstacles[ix, iy, iz] == 1:
              return self._get_observation(), -2.0, True, {'status': 'collision'}
-             
-        # C. 未知区域检查 (飞出安全区)
-        # 如果当前位置不在 Known Mask 内，视为极度危险
         if not self.known_mask[ix, iy, iz]:
              return self._get_observation(), -2.0, True, {'status': 'unsafe_area'}
+             
+        # 【新增】背后偷窥惩罚
+        if is_behind_wall:
+             # 如果跑到了墙后面，这在实际中是很难发生的（因为是未知区），
+             # 而且从后面看前面是没有探索价值的。
+             return self._get_observation(), -5.0, True, {'status': 'behind_wall'}
 
-        # --- 3. 合法位置：计算收益 ---
-        
-        # Raycast 扫描
+        # --- 3. 奖励计算 ---
         covered_set = self.raycaster.scan(self.gt_grid, target_pos, target_yaw)
         
         surface_hits = 0
         volume_hits = 0
         
         for p in covered_set:
-            # 收益 A: 覆盖前沿表面 (Surface Coverage) - 权重高
             if p in self.frontier_set:
                 surface_hits += 1
-            # 收益 B: 穿透未知体积 (Volume Penetration) - 权重低
             elif self.unknown_mask[p]:
                 volume_hits += 1
         
-        # 原始奖励值
-        raw_reward = (surface_hits * 1.0) + (volume_hits * 0.05)
+        # 覆盖率奖励
+        total_frontiers = max(1, len(self.frontier_pts))
+        coverage_ratio = surface_hits / total_frontiers
+        r_coverage = coverage_ratio * 5.0
         
-        # 距离惩罚 (正则项，防止飞太远)
-        dist_penalty = 0.005 * np.linalg.norm([lx, ly, lz])
+        # 体积奖励
+        r_volume = volume_hits * 0.005
         
-        # 【关键】奖励缩放：将几百的分数缩放到个位数，防止梯度爆炸
-        # 例如: hits=200 -> reward=2.0. 这样与惩罚 -2.0 量级相当
-        reward = (raw_reward * 0.01) - dist_penalty
+        # 【新增】正视奖励 (Orthogonality Reward)
+        # 鼓励视线方向 与 墙面法向 相反 (即：正对着墙看)
+        # Agent View Vector
+        view_vec = np.array([np.cos(target_yaw), np.sin(target_yaw), 0])
+        # dot should be close to -1 (antiparallel)
+        ortho_score = -np.dot(view_vec, wall_normal) # Range [-1, 1], 1 is best
+        # 只有在看到了东西的情况下才给这个奖励
+        if surface_hits > 0:
+            r_ortho = max(0, ortho_score) * 1.0
+        else:
+            r_ortho = 0
+            
+        # 距离引导 (保持在正面 8 米左右)
+        r_dist_guide = 0
+        if dist_in_front > 0: # 只有在前面才引导距离
+            r_dist_guide = 0.5 * np.exp(-((dist_in_front - 8.0)**2) / (2 * 4.0**2))
+
+        # 总奖励
+        reward = r_coverage + r_volume + r_ortho + r_dist_guide
         
         return self._get_observation(), reward, True, {'status': 'success'}

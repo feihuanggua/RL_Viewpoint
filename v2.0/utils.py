@@ -62,10 +62,9 @@ class FrontierProcessor:
     def __init__(self, grid_size=32):
         self.grid_size = grid_size
 
-    def align_cluster_horizontal(self, cluster_points):
+    def align_cluster_horizontal(self, cluster_points, robot_pos=None):
         """
-        只在 XY 平面上做 PCA，保留 Z 轴倾斜特征。
-        返回: aligned_points (N, 3), center (3,), yaw_angle
+        只在 XY 平面上做 PCA，并强制法向量指向 robot_pos (即已知区域一侧)
         """
         if len(cluster_points) < 3:
             return cluster_points, np.mean(cluster_points, axis=0), 0.0
@@ -73,15 +72,25 @@ class FrontierProcessor:
         center = np.mean(cluster_points, axis=0)
         centered = cluster_points - center
         
-        # 只取 XY 做 PCA
         points_2d = centered[:, :2]
         pca = PCA(n_components=2).fit(points_2d)
         
         # 假设最小方差方向是法向 (指向墙外)
         normal_2d = pca.components_[1] 
+        
+        # --- 【新增】方向校正逻辑 ---
+        # 我们希望法向量指向 Robot (或者 Known Space)
+        # 这样 Local 坐标系的 X轴正方向 永远是"墙的正面"
+        if robot_pos is not None:
+            # 计算从中心指向 Robot 的向量
+            vec_to_robot = robot_pos[:2] - center[:2]
+            # 如果法向量和 Robot方向相反，就翻转它
+            if np.dot(normal_2d, vec_to_robot) < 0:
+                normal_2d = -normal_2d
+
         yaw = np.arctan2(normal_2d[1], normal_2d[0])
         
-        # 逆旋转矩阵 (把墙转正)
+        # 逆旋转矩阵
         c, s = np.cos(-yaw), np.sin(-yaw)
         R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
         
