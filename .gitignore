@@ -1,0 +1,45 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+env/
+.venv/
+venv/
+
+# Data and outputs
+*.pt
+*.pth
+*.npy
+*.npz
+*.h5
+*.csv
+*.pkl
+*.log
+
+# Dataset directories
+processed_data.pt
+**/fuel_dataset/**
+**/dataset/**
+**/*dataset*/**
+
+# Checkpoints and model weights
+checkpoints/
+**/*checkpoint*.pth
+**/*best_model*.pth
+**/*latest_checkpoint*.pth
+**/goodpth/**
+**/model_weights/**
+
+# Training artifacts
+**/training_log.csv
+**/run_*/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
